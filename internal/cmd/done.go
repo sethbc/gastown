@@ -22,6 +22,7 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
+	"github.com/steveyegge/gastown/internal/templates"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/townlog"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -287,10 +288,19 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("\n%s Uncommitted changes detected — auto-saving to prevent work loss\n", style.Bold.Render("⚠"))
 			fmt.Printf("  Files: %s\n\n", workStatus.String())
 
-			// Stage all changes (git add -A)
+			// Stage all changes (git add -A), then unstage overlay files (gt-p35).
 			if addErr := g.Add("-A"); addErr != nil {
 				style.PrintWarning("auto-commit: git add failed: %v — uncommitted work may be at risk", addErr)
 			} else {
+				// Unstage Gas Town overlay files that git add -A picked up.
+				// These are runtime artifacts that must not be committed to repos.
+				_ = g.ResetFiles("CLAUDE.local.md")
+				// Only unstage CLAUDE.md if it contains the overlay marker
+				if claudeData, readErr := os.ReadFile(filepath.Join(cwd, "CLAUDE.md")); readErr == nil {
+					if strings.Contains(string(claudeData), templates.PolecatLifecycleMarker) {
+						_ = g.ResetFiles("CLAUDE.md")
+					}
+				}
 				// Build a descriptive commit message
 				autoMsg := "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
 				if issueFromBranch := parseBranchName(branch).Issue; issueFromBranch != "" {
@@ -546,6 +556,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			} else if contam.Behind >= warnThreshold {
 				style.PrintWarning("branch is %d commits behind %s — consider rebasing to avoid PR contamination", contam.Behind, originDefault)
 			}
+		}
+
+		// Strip Gas Town overlay from CLAUDE.md / CLAUDE.local.md (gt-p35).
+		// Polecats commit the overlay (polecat lifecycle boilerplate) into repos,
+		// overwriting project-specific CLAUDE.md content. Detect and revert before push.
+		if stripped := stripOverlayCLAUDEmd(g, defaultBranch); stripped {
+			// Recalculate commits ahead since we added a cleanup commit
+			aheadCount, _ = g.CommitsAhead("origin/"+defaultBranch, "HEAD")
 		}
 
 		// Determine merge strategy from convoy (gt-myofa.3)
@@ -1735,6 +1753,97 @@ func selfKillSession(townRoot string, roleInfo RoleInfo) error {
 	}
 
 	return nil
+}
+
+// stripOverlayCLAUDEmd detects and removes Gas Town overlay content from CLAUDE.md
+// and CLAUDE.local.md before the branch is pushed. Polecats were committing the
+// overlay (which contains polecat lifecycle boilerplate like "Idle Polecat Heresy",
+// "gt done" protocol, etc.) into actual repos, overwriting project-specific CLAUDE.md
+// content. (gt-p35)
+//
+// This runs after all commits but before push. If overlay files are detected in
+// the branch diff, they are restored (CLAUDE.md) or removed (CLAUDE.local.md)
+// and a cleanup commit is created.
+//
+// Returns true if a cleanup commit was created.
+func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
+	originRef := "origin/" + defaultBranch
+
+	// Check which files changed on this branch vs origin/main
+	changedFiles, err := g.DiffNameOnly(originRef, "HEAD")
+	if err != nil {
+		// Can't determine diff — skip silently (push will still work)
+		return false
+	}
+
+	claudeChanged := false
+	claudeLocalChanged := false
+	for _, f := range changedFiles {
+		switch f {
+		case "CLAUDE.md":
+			claudeChanged = true
+		case "CLAUDE.local.md":
+			claudeLocalChanged = true
+		}
+	}
+
+	if !claudeChanged && !claudeLocalChanged {
+		return false // Nothing to strip
+	}
+
+	needsCommit := false
+
+	// Handle CLAUDE.md: check if the committed version contains overlay marker
+	if claudeChanged {
+		// Read current CLAUDE.md from HEAD
+		currentContent, showErr := g.ShowFile("HEAD", "CLAUDE.md")
+		if showErr == nil && strings.Contains(currentContent, templates.PolecatLifecycleMarker) {
+			// Current CLAUDE.md has overlay content — restore from origin
+			origContent, origErr := g.ShowFile(originRef, "CLAUDE.md")
+			if origErr != nil {
+				// CLAUDE.md didn't exist on origin/main — the overlay created it.
+				// Remove it from tracking.
+				if rmErr := g.RmCached("CLAUDE.md"); rmErr == nil {
+					needsCommit = true
+					fmt.Printf("%s Removed overlay CLAUDE.md (did not exist on %s)\n",
+						style.Bold.Render("→"), defaultBranch)
+				}
+			} else {
+				// CLAUDE.md existed on origin — restore original content
+				_ = origContent // Restore via checkout
+				if coErr := g.CheckoutFileFromRef(originRef, "CLAUDE.md"); coErr == nil {
+					if addErr := g.Add("CLAUDE.md"); addErr == nil {
+						needsCommit = true
+						fmt.Printf("%s Restored original CLAUDE.md (stripped Gas Town overlay)\n",
+							style.Bold.Render("→"))
+					}
+				}
+			}
+		}
+	}
+
+	// Handle CLAUDE.local.md: always remove from commits (it's a runtime artifact)
+	if claudeLocalChanged {
+		if rmErr := g.RmCached("CLAUDE.local.md"); rmErr == nil {
+			needsCommit = true
+			fmt.Printf("%s Removed CLAUDE.local.md from branch (Gas Town overlay)\n",
+				style.Bold.Render("→"))
+		}
+	}
+
+	if !needsCommit {
+		return false
+	}
+
+	// Create cleanup commit
+	if commitErr := g.Commit("chore: strip Gas Town overlay from CLAUDE.md (gt-p35)"); commitErr != nil {
+		style.PrintWarning("failed to create overlay cleanup commit: %v", commitErr)
+		return false
+	}
+
+	fmt.Printf("%s Created cleanup commit to remove Gas Town overlay files\n",
+		style.Bold.Render("✓"))
+	return true
 }
 
 // purgeClosedEphemeralBeads removes closed ephemeral beads (wisps) that accumulated

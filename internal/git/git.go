@@ -535,6 +535,54 @@ func (g *Git) CommitAll(message string) error {
 	return err
 }
 
+// ResetFiles unstages files without modifying the working tree.
+// Equivalent to: git reset HEAD -- <paths>
+func (g *Git) ResetFiles(paths ...string) error {
+	args := append([]string{"reset", "HEAD", "--"}, paths...)
+	_, err := g.run(args...)
+	return err
+}
+
+// ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
+// Returns empty string and no error if the file does not exist at that ref.
+func (g *Git) ShowFile(ref, path string) (string, error) {
+	out, err := g.run("show", ref+":"+path)
+	if err != nil {
+		// "does not exist" or "exists on disk, but not in" are expected for missing files
+		return "", err
+	}
+	return out, nil
+}
+
+// CheckoutFileFromRef restores a file from a given ref (e.g., "origin/main").
+// Equivalent to: git checkout <ref> -- <path>
+func (g *Git) CheckoutFileFromRef(ref string, paths ...string) error {
+	args := append([]string{"checkout", ref, "--"}, paths...)
+	_, err := g.run(args...)
+	return err
+}
+
+// RmCached removes files from the index without deleting from the working tree.
+// Equivalent to: git rm --cached --force <paths>
+func (g *Git) RmCached(paths ...string) error {
+	args := append([]string{"rm", "--cached", "--force", "--ignore-unmatch"}, paths...)
+	_, err := g.run(args...)
+	return err
+}
+
+// DiffNameOnly returns filenames changed between two refs.
+// Equivalent to: git diff --name-only <base>...<head>
+func (g *Git) DiffNameOnly(base, head string) ([]string, error) {
+	out, err := g.run("diff", "--name-only", base+"..."+head)
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(strings.TrimSpace(out), "\n"), nil
+}
+
 // GitStatus represents the status of the working directory.
 type GitStatus struct {
 	Clean    bool
@@ -1553,6 +1601,11 @@ func isGasTownRuntimePath(path string) bool {
 		if bare == name {
 			return true
 		}
+	}
+	// CLAUDE.local.md is a Gas Town overlay file written by CreatePolecatCLAUDEmd.
+	// It must not be staged by the auto-commit safety net or committed to the repo.
+	if bare == "CLAUDE.local.md" {
+		return true
 	}
 	return false
 }
